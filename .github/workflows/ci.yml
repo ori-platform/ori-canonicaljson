@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: none
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    env:
+      CGO_ENABLED: "0"
+      GOFLAGS: "-mod=readonly"
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # This module has no third-party dependencies and must not acquire one.
+      # A signing preimage is not a place to take a supply-chain risk, and the
+      # standard library is sufficient for every rule here.
+      - name: Guard the zero-dependency policy
+        run: |
+          if grep -qE '^\s*require' go.mod; then
+            echo "go.mod declares a dependency; this module is standard-library only" >&2
+            exit 1
+          fi
+          if [ -f go.sum ] && [ -s go.sum ]; then
+            echo "go.sum is non-empty; this module is standard-library only" >&2
+            exit 1
+          fi
+
+      - name: Ensure workflow actions are pinned
+        run: |
+          refs="$(grep -RhoE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]]+' .github/workflows || true)"
+          bad="$(printf '%s\n' "$refs" | awk -F@ 'NF > 1 && $2 !~ /^[0-9a-f]{40}$/ {print}')"
+          if [ -n "$bad" ]; then
+            printf 'Mutable GitHub Actions refs are forbidden:\n%s\n' "$bad" >&2
+            exit 1
+          fi
+
+      - name: Verify module integrity
+        run: go mod verify
+
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'gofmt would reformat:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The vendored corpus proves cross-language agreement. It must never be
+      # skipped: a conformance suite that quietly does nothing is worse than
+      # none, because it reports success.
+      - name: Test
+        run: go test ./... -v 2>&1 | tee /tmp/test.log
+
+      - name: Refuse a skipped conformance test
+        run: |
+          if grep -q -- "--- SKIP" /tmp/test.log; then
+            echo "a test skipped; this suite has no conditional cases" >&2
+            grep -- "--- SKIP" /tmp/test.log >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
