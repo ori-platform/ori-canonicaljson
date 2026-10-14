@@ -69,7 +69,7 @@ type Shape struct {
 // arrived as. A member holding an object can be decoded the same way with its
 // shape. shape may be nil, which defines no members.
 func DecodeStrict(raw []byte, shape *Shape) (map[string]json.RawMessage, error) {
-	if err := checkStrict(raw, shape); err != nil {
+	if err := check(raw, shape, memberRule); err != nil {
 		return nil, err
 	}
 	var members map[string]json.RawMessage
@@ -79,13 +79,39 @@ func DecodeStrict(raw []byte, shape *Shape) (map[string]json.RawMessage, error) 
 	return members, nil
 }
 
-// checkStrict applies the strict member rule to raw, then the refusals that
-// need shape, and returns the highest-ranked refusal present.
-func checkStrict(raw []byte, shape *Shape) error {
+// rule is the set of refusals a check applies.
+type rule struct {
+	// strict adds the refusals of gateway-api/v2's strict member rule that
+	// not every contract makes: nesting_too_deep, case_variant_member and
+	// not_an_object.
+	strict bool
+	// trackDepth is how deep names are tracked. A level past it is only
+	// parsed: no refusal it could hold would change the outcome.
+	trackDepth int
+}
+
+// maxDecoderDepth is the nesting encoding/json refuses beyond.
+const maxDecoderDepth = 10000
+
+var (
+	// memberRule is gateway-api/v2's strict member rule, for runtime-gateway
+	// payloads. Past MaxNestingDepth only malformed_json can outrank the
+	// nesting refusal already recorded.
+	memberRule = rule{strict: true, trackDepth: MaxNestingDepth}
+	// canonicalRule is what every contract MarshalWire canonicalises for
+	// already refuses: invalid Unicode, malformed JSON, trailing data and a
+	// member named twice. Past maxDecoderDepth the decode MarshalWire makes
+	// next refuses the document anyway.
+	canonicalRule = rule{trackDepth: maxDecoderDepth}
+)
+
+// check applies r to raw, then the refusals that need shape, and returns the
+// highest-ranked refusal present.
+func check(raw []byte, shape *Shape, r rule) error {
 	if err := ValidateWireUnicode(raw); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidUnicode, err)
 	}
-	s := scanner{data: raw}
+	s := scanner{data: raw, rule: r}
 	if err := s.scan(shape); err != nil {
 		return err
 	}
@@ -122,7 +148,7 @@ type frame struct {
 	index  int
 }
 
-// deepObject and deepArray stand for every level past MaxNestingDepth.
+// deepObject and deepArray stand for every level past the tracked depth.
 var (
 	deepObject = &frame{object: true}
 	deepArray  = &frame{}
@@ -130,11 +156,13 @@ var (
 
 // scanner walks a document without recursion, so no depth limit of its own
 // can turn a deep document into a syntax error: nesting_too_deep must outrank
-// nothing but invalid_unicode and malformed_json.
+// nothing but invalid_unicode and malformed_json. It records only the
+// refusals its rule applies.
 type scanner struct {
 	data  []byte
 	pos   int
 	stack []*frame
+	rule  rule
 
 	tooDeep, trailing, duplicate, caseVariant, notObject, missing *refusal
 }
@@ -147,7 +175,7 @@ func (s *scanner) malformed(what string) error {
 // of each refusal below malformed_json and returning malformed_json at once.
 func (s *scanner) scan(root *Shape) error {
 	s.skipSpace()
-	if s.pos < len(s.data) && s.data[s.pos] != '{' {
+	if s.rule.strict && s.pos < len(s.data) && s.data[s.pos] != '{' {
 		s.notObject = &refusal{reason: ErrNotAnObject}
 	}
 	pending := root
@@ -162,11 +190,10 @@ func (s *scanner) scan(root *Shape) error {
 			s.pos++
 			var f *frame
 			switch {
-			case len(s.stack) >= MaxNestingDepth:
-				// Past the bound only malformed_json still outranks the
-				// refusal already recorded, so a deep level is only
-				// parsed: it shares one frame and tracks no names, and a
-				// hostile depth costs a pointer a level.
+			case len(s.stack) >= s.rule.trackDepth:
+				// Past the tracked depth a level is only parsed: it shares
+				// one frame and tracks no names, and a hostile depth
+				// costs a pointer a level.
 				f = deepArray
 				if c == '{' {
 					f = deepObject
@@ -179,7 +206,7 @@ func (s *scanner) scan(root *Shape) error {
 			// An array's elements have no shape.
 			pending = nil
 			s.stack = append(s.stack, f)
-			if len(s.stack) > MaxNestingDepth && s.tooDeep == nil {
+			if s.rule.strict && len(s.stack) > MaxNestingDepth && s.tooDeep == nil {
 				s.tooDeep = &refusal{reason: ErrNestingTooDeep, detail: "at " + s.path()}
 			}
 			s.skipSpace()
@@ -345,7 +372,7 @@ func (s *scanner) member() (*Shape, error) {
 }
 
 func (s *scanner) noteCaseVariant(name, other string) {
-	if s.caseVariant == nil {
+	if s.rule.strict && s.caseVariant == nil {
 		s.caseVariant = &refusal{reason: ErrCaseVariantMember, detail: fmt.Sprintf(
 			"member %s and %s at %s", boundedQuote(name), boundedQuote(other), s.path())}
 	}

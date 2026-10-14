@@ -70,19 +70,32 @@ struct fields without regard to case, `ſ` (U+017F) and the Kelvin sign
 to `{"status":"healthy"}` and its signature verifies, while a reader of the
 first value sees `critical`; and a struct decoder reads `STATUS` as `status`.
 
-`DecodeStrict` and `MarshalWire` refuse such a document under the strict member
-rule of `ori-specs/gateway-api/v2.md`. Each refusal wraps one sentinel error,
-and when several apply the earliest in this list wins, so every reader names
-the same reason:
+Two functions refuse such documents, each under the rule that fits its
+callers, with one sentinel error per reason:
 
-| Error | Refused when |
-| --- | --- |
-| `ErrInvalidUnicode` | invalid UTF-8, or a lone or misordered surrogate escape |
-| `ErrMalformedJSON` | not one JSON value, `NaN` and `Infinity` included |
-| `ErrNestingTooDeep` | nesting above `MaxNestingDepth` (32), counting objects and arrays |
-| `ErrTrailingData` | anything but whitespace after the value |
-| `ErrDuplicateMember` | two members of one object with the same name, compared after unescaping |
-| `ErrCaseVariantMember` | two names in one object equal under the closed fold, or a name equal under it to a member the caller's `Shape` defines |
+- `MarshalWire` canonicalises for every contract that signs JSON, so it
+  refuses only what all of them already refuse: invalid Unicode, malformed
+  JSON, trailing data and a member named twice, at any depth. A shared
+  canonicaliser that refused more would refuse documents some contract
+  accepts.
+- `DecodeStrict` applies the strict member rule of
+  `ori-specs/gateway-api/v2.md`, for runtime–gateway payloads, which a gateway
+  admits with it before it canonicalises or decodes them. It refuses the
+  above and also nesting above `MaxNestingDepth` (32), names equal under the
+  closed fold, and a top-level value that is not an object.
+
+When several reasons apply, the earliest in this list wins, so every reader
+names the same reason:
+
+| Error | Refused when | `MarshalWire` | `DecodeStrict` |
+| --- | --- | --- | --- |
+| `ErrInvalidUnicode` | invalid UTF-8, or a lone or misordered surrogate escape | yes | yes |
+| `ErrMalformedJSON` | not one JSON value, `NaN`, `Infinity` and a byte order mark included | yes | yes |
+| `ErrNestingTooDeep` | nesting above 32, counting objects and arrays | | yes |
+| `ErrTrailingData` | anything but JSON whitespace after the value | yes | yes |
+| `ErrDuplicateMember` | two members of one object with the same name, compared after unescaping | yes | yes |
+| `ErrCaseVariantMember` | two names in one object equal under the closed fold, or a name equal under it to a member the caller's `Shape` defines | | yes |
+| `ErrNotAnObject` | a top-level value that is not an object | | yes |
 
 The closed fold folds ASCII letters, `ſ` to `s` and the Kelvin sign to `k`,
 and nothing else. It is not Unicode case folding, which changes with the
@@ -90,12 +103,12 @@ Unicode version a toolchain ships; it is exactly what `encoding/json` matches
 to an ASCII field name, and a test sweeping every scalar value fails if a
 toolchain's decoder ever matches more. Every object at every depth is checked,
 arrays included, without recursion, so a deep document is refused as too deep
-rather than as malformed.
+rather than as malformed, and a hostile depth costs nothing per level past the
+depth that can still change the outcome.
 
-Two refusals follow the rule: `ErrNotAnObject` for a top-level value that is
-not an object, and `ErrMissingMember` for a member a `Shape` requires.
-`DecodeStrict` returns the top-level members by exact name, each the bytes it
-arrived as; member types are the caller's to check.
+`DecodeStrict` also refuses `ErrMissingMember` for a member a `Shape`
+requires, after every reason above. It returns the top-level members by exact
+name, each the bytes it arrived as; member types are the caller's to check.
 
 ```go
 members, err := canonicaljson.DecodeStrict(payload, &canonicaljson.Shape{
@@ -117,10 +130,11 @@ to the module rather than an implementation detail:
 - A bare `float64`, `float32`, `int`, `int64` or `uint64` is refused.
 - A `json.Number` reaches the wire with its spelling untouched.
 - Malformed or unpaired Unicode is refused, and valid surrogate pairs are not.
-- A member named twice, two names equal under the closed fold, nesting above
-  32, and trailing data are each refused with their own error, in the strict
-  member rule's precedence; a clean canonical document round-trips byte for
-  byte, and the strict scan agrees with `encoding/json` on what is valid JSON.
+- `MarshalWire` refuses a member named twice at any depth, and refuses
+  nothing a contract it serves accepts. `DecodeStrict` refuses each reason of
+  the strict member rule with its own error, in the rule's precedence. A clean
+  canonical document round-trips byte for byte, and the scan agrees with
+  `encoding/json` on what is valid JSON.
 - The `d011` zone boundaries hold on both sides, and negative zero survives as
   `-0.0` rather than being normalised away.
 

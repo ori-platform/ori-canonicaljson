@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -113,6 +114,9 @@ var strictCases = []struct {
 	{"lone surrogate", `{"a":"\ud800"}`, canonicaljson.ErrInvalidUnicode},
 
 	{"not an object", `[]`, canonicaljson.ErrNotAnObject},
+	{"a duplicate inside a top-level array", `[{"a":1,"a":2}]`, canonicaljson.ErrDuplicateMember},
+	{"a byte order mark", "\ufeff{}", canonicaljson.ErrMalformedJSON},
+	{"a duplicate deeper than the bound", nested(40, `{"a":1,"a":2}`), canonicaljson.ErrNestingTooDeep},
 	{"a scalar", `1`, canonicaljson.ErrNotAnObject},
 
 	// Precedence: the earliest reason in the rule's table wins.
@@ -128,15 +132,70 @@ var strictCases = []struct {
 	{"not an object and trailing data", `[] x`, canonicaljson.ErrTrailingData},
 }
 
+// errDecoderRefuses marks a document MarshalWire refuses through
+// encoding/json's own decode, with no reason of the strict member rule.
+var errDecoderRefuses = errors.New("refused by the decoder")
+
+// marshalWireDiffers is what MarshalWire does with the cases where
+// DecodeStrict refuses for a reason only gateway-api/v2 makes: case variants,
+// nesting above 32 and a top-level value that is not an object. MarshalWire
+// refuses only what every contract it canonicalises for refuses.
+var marshalWireDiffers = map[string]error{
+	"ASCII case variants":                  nil,
+	"long s":                               nil,
+	"long s escaped":                       nil,
+	"Kelvin sign":                          nil,
+	"Kelvin sign escaped":                  nil,
+	"Kelvin sign against an upper-case K":  nil,
+	"case variants in an array element":    nil,
+	"Turkish escaped":                      nil,
+	"depth 33":                             nil,
+	"depth 33 through arrays in an object": nil,
+	"depth 33 through arrays":              errDecoderRefuses,
+	"depth 20000":                          errDecoderRefuses,
+	"not an object":                        errDecoderRefuses,
+	"a scalar":                             errDecoderRefuses,
+	"too deep and trailing":                canonicaljson.ErrTrailingData,
+	"a duplicate below the bound and nesting above it": canonicaljson.ErrDuplicateMember,
+	"a case variant and trailing data":                 canonicaljson.ErrTrailingData,
+	"a duplicate deeper than the bound":                canonicaljson.ErrDuplicateMember,
+}
+
 // TestStrictMemberRule runs every case through both entry points.
 func TestStrictMemberRule(t *testing.T) {
 	for _, c := range strictCases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := canonicaljson.DecodeStrict([]byte(c.doc), nil)
 			requireReason(t, "DecodeStrict", err, c.want)
+			wire, differs := marshalWireDiffers[c.name]
+			if !differs {
+				wire = c.want
+			}
 			_, err = canonicaljson.MarshalWire([]byte(c.doc))
-			requireReason(t, "MarshalWire", err, c.want)
+			if wire == errDecoderRefuses {
+				if err == nil {
+					t.Fatal("MarshalWire accepted it")
+				}
+				for _, reason := range reasons {
+					if errors.Is(err, reason) {
+						t.Fatalf("MarshalWire: err = %v, want the decoder's refusal and no rule reason", err)
+					}
+				}
+				return
+			}
+			requireReason(t, "MarshalWire", err, wire)
 		})
+	}
+	for name := range marshalWireDiffers {
+		if !slices.ContainsFunc(strictCases, func(c struct {
+			name string
+			doc  string
+			want error
+		}) bool {
+			return c.name == name
+		}) {
+			t.Errorf("marshalWireDiffers names %q, which is not a case", name)
+		}
 	}
 }
 
@@ -313,5 +372,22 @@ func TestHostileDepthCostsNoAllocationPerLevel(t *testing.T) {
 				t.Fatalf("the scan made %.0f allocations for %d levels; a level past the bound must cost none", allocs, depth)
 			}
 		})
+	}
+}
+
+// TestMarshalWireBoundsHostileDepth scans a document a million levels deep
+// through MarshalWire, which tracks names as deep as encoding/json decodes and
+// no deeper: its cost is bounded by that depth, not by the document's.
+func TestMarshalWireBoundsHostileDepth(t *testing.T) {
+	doc := []byte(nested(1_000_000, `1`))
+	var err error
+	allocs := testing.AllocsPerRun(1, func() {
+		_, err = canonicaljson.MarshalWire(doc)
+	})
+	if err == nil {
+		t.Fatal("MarshalWire accepted a document a million levels deep")
+	}
+	if allocs > 100_000 {
+		t.Fatalf("MarshalWire made %.0f allocations for a million levels; past the decoder's depth a level must cost none", allocs)
 	}
 }
