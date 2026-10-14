@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	canonicaljson "github.com/ori-platform/ori-canonicaljson"
 )
@@ -115,5 +116,45 @@ func TestMarshalSortsKeysByCodePoint(t *testing.T) {
 	want := "{\"a\":3,\"＀\":2,\"\U0001F600\":1}"
 	if string(got) != want {
 		t.Errorf("key order = %s, want %s", got, want)
+	}
+}
+
+// TestValidateWireUnicodeReadsABackslashRunOnce scans payloads made of long
+// backslash runs, inside a string and outside one. Each backslash is read
+// once, so a megabyte takes a moment; a scan that recounts the run behind
+// every backslash takes minutes, and an unauthenticated payload reaches this
+// check before any signature is verified.
+func TestValidateWireUnicodeReadsABackslashRunOnce(t *testing.T) {
+	run := strings.Repeat(`\`, 1<<20)
+	for name, payload := range map[string]string{
+		"inside a string":  `{"a":"` + run + `"}`,
+		"outside a string": run,
+	} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = canonicaljson.ValidateWireUnicode([]byte(payload))
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: a megabyte of backslashes took over two seconds", name)
+		}
+	}
+}
+
+// TestValidateWireUnicodeReadsBackslashParity requires an escaped backslash
+// never to start an escape, and an unescaped one always to.
+func TestValidateWireUnicodeReadsBackslashParity(t *testing.T) {
+	for doc, refused := range map[string]bool{
+		`{"a":"\\ud800"}`:        false, // an escaped backslash, then the text ud800
+		`{"a":"\\\ud800"}`:       true,  // an escaped backslash, then a lone surrogate
+		`{"a":"\\\\ud800"}`:      false,
+		`{"a":"\\\ud83d\ude00"}`: false, // an escaped backslash, then a pair
+		`{"a":"\u0041\udc00"}`:   true,  // a low surrogate after an ordinary escape
+	} {
+		if err := canonicaljson.ValidateWireUnicode([]byte(doc)); (err != nil) != refused {
+			t.Errorf("ValidateWireUnicode(%s) = %v, want refused %v", doc, err, refused)
+		}
 	}
 }

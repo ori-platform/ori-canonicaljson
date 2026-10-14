@@ -175,16 +175,15 @@ func ValidateWireUnicode(raw []byte) error {
 	if !utf8.Valid(raw) {
 		return fmt.Errorf("canonicaljson: payload is not valid UTF-8")
 	}
+	// One forward pass: a backslash consumes the byte after it, so a backslash
+	// escaped by another is never read as starting an escape, and no run of
+	// backslashes is counted twice.
 	for i := 0; i+1 < len(raw); i++ {
 		if raw[i] != '\\' {
 			continue
 		}
-		// A backslash run of even length is escaped backslashes, not an escape.
-		backslashes := 0
-		for j := i; j >= 0 && raw[j] == '\\'; j-- {
-			backslashes++
-		}
-		if backslashes%2 == 0 || raw[i+1] != 'u' {
+		if raw[i+1] != 'u' {
+			i++
 			continue
 		}
 		high, ok := parseHex4(raw, i+2)
