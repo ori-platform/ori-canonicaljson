@@ -122,6 +122,12 @@ type frame struct {
 	index  int
 }
 
+// deepObject and deepArray stand for every level past MaxNestingDepth.
+var (
+	deepObject = &frame{object: true}
+	deepArray  = &frame{}
+)
+
 // scanner walks a document without recursion, so no depth limit of its own
 // can turn a deep document into a syntax error: nesting_too_deep must outrank
 // nothing but invalid_unicode and malformed_json.
@@ -154,11 +160,21 @@ func (s *scanner) scan(root *Shape) error {
 		switch c := s.data[s.pos]; {
 		case c == '{' || c == '[':
 			s.pos++
-			f := &frame{object: c == '{'}
-			if f.object {
-				f.shape = pending
-				f.names = map[string]struct{}{}
-				f.folded = map[string]string{}
+			var f *frame
+			switch {
+			case len(s.stack) >= MaxNestingDepth:
+				// Past the bound only malformed_json still outranks the
+				// refusal already recorded, so a deep level is only
+				// parsed: it shares one frame and tracks no names, and a
+				// hostile depth costs a pointer a level.
+				f = deepArray
+				if c == '{' {
+					f = deepObject
+				}
+			case c == '{':
+				f = &frame{object: true, shape: pending, names: map[string]struct{}{}, folded: map[string]string{}}
+			default:
+				f = &frame{}
 			}
 			// An array's elements have no shape.
 			pending = nil
@@ -284,6 +300,16 @@ func (s *scanner) member() (*Shape, error) {
 	if err := s.skipString(); err != nil {
 		return nil, err
 	}
+	top := s.stack[len(s.stack)-1]
+	if top.names == nil {
+		// A level past the bound: its names cannot change the refusal.
+		s.skipSpace()
+		if s.pos >= len(s.data) || s.data[s.pos] != ':' {
+			return nil, s.malformed("expected a colon")
+		}
+		s.pos++
+		return nil, nil
+	}
 	var name string
 	if err := json.Unmarshal(s.data[start:s.pos], &name); err != nil {
 		return nil, s.malformed("invalid member name")
@@ -293,7 +319,6 @@ func (s *scanner) member() (*Shape, error) {
 		return nil, s.malformed("expected a colon")
 	}
 	s.pos++
-	top := s.stack[len(s.stack)-1]
 	top.member = name
 	if _, seen := top.names[name]; seen {
 		if s.duplicate == nil {

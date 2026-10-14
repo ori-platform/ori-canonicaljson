@@ -287,3 +287,31 @@ func FuzzTheScannerAgreesWithEncodingJSON(f *testing.F) {
 		}
 	})
 }
+
+// TestHostileDepthCostsNoAllocationPerLevel scans documents a million levels
+// deep. Past the bound a level only needs parsing, so a hostile depth must not
+// cost an allocation a level: the scan stays within a fixed budget, whatever
+// the depth, and still names the right refusal.
+func TestHostileDepthCostsNoAllocationPerLevel(t *testing.T) {
+	const depth = 1_000_000
+	for _, c := range []struct {
+		name string
+		doc  []byte
+		want error
+	}{
+		{"objects", []byte(nested(depth, `1`)), canonicaljson.ErrNestingTooDeep},
+		{"arrays", []byte(`{"a":` + strings.Repeat("[", depth) + strings.Repeat("]", depth) + `}`), canonicaljson.ErrNestingTooDeep},
+		{"objects never closed", []byte(strings.Repeat(`{"a":`, depth)), canonicaljson.ErrMalformedJSON},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var err error
+			allocs := testing.AllocsPerRun(1, func() {
+				_, err = canonicaljson.DecodeStrict(c.doc, nil)
+			})
+			requireReason(t, "DecodeStrict", err, c.want)
+			if allocs > 500 {
+				t.Fatalf("the scan made %.0f allocations for %d levels; a level past the bound must cost none", allocs, depth)
+			}
+		})
+	}
+}
