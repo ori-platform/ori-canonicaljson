@@ -85,5 +85,12 @@ jobs:
             exit 1
           fi
 
+      # A scan shares no state between calls; only the race detector can see
+      # one that does. It needs cgo, which the module itself never uses.
+      - name: Test under the race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./...
+
       - name: Build
         run: go build ./...
