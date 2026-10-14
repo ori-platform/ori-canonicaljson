@@ -1,0 +1,9 @@
+{
+  "source_repository": "ori-platform/ori-specs",
+  "source_path": "gateway-api/vectors",
+  "source_commit": "9644f58f73eb7ced035767eea199467e79796cec",
+  "note": "Vendored copy of the gateway-api/v2 payload member rule corpus. DecodeStrict must name each case's expected reason, or accept it. Digests detect a local edit; the source commit is the provenance trail.",
+  "files": {
+    "payload-members-v2.json": "ef09a43819d6794ff3b8ee1f6ed06b8d2002b6a0133d95e224d6e0806a7d17eb"
+  }
+}

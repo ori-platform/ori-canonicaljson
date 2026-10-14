@@ -132,6 +132,9 @@ to the module rather than an implementation detail:
 - A bare `float64`, `float32`, `int`, `int64` or `uint64` is refused.
 - A `json.Number` reaches the wire with its spelling untouched.
 - Malformed or unpaired Unicode is refused, and valid surrogate pairs are not.
+- `DecodeStrict` names the expected reason, or accepts, for every case of the
+  vendored `gateway-api/v2` payload member corpus, and `MarshalWire` agrees
+  wherever the case's reason is one it applies.
 - `MarshalWire` refuses a member named twice at any depth, and refuses
   nothing a contract it serves accepts. `DecodeStrict` refuses each reason of
   the strict member rule with its own error, in the rule's precedence. A clean
@@ -140,7 +143,7 @@ to the module rather than an implementation detail:
 - The `d011` zone boundaries hold on both sides, and negative zero survives as
   `-0.0` rather than being normalised away.
 
-The vendored corpus carries a `MANIFEST.json` recording the `ori-specs` commit
+Each vendored corpus carries a `MANIFEST.json` recording the `ori-specs` commit
 it came from and its digest. A local edit fails the suite; moving the pin is a
 deliberate, separately reviewed change.
 
