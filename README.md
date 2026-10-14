@@ -84,18 +84,20 @@ callers, with one sentinel error per reason:
   above and also nesting above `MaxNestingDepth` (32), names equal under the
   closed fold, and a top-level value that is not an object.
 
-When several reasons apply, the earliest in this list wins, so every reader
-names the same reason:
+When several reasons apply, the earliest in this list wins, wherever in the
+document each sits, so every reader names the same reason. `MarshalWire`
+refuses a value that is not an object, or nests deeper than `encoding/json`
+decodes (10000), with the decoder's own error, as it always has:
 
 | Error | Refused when | `MarshalWire` | `DecodeStrict` |
 | --- | --- | --- | --- |
-| `ErrInvalidUnicode` | invalid UTF-8, or a lone or misordered surrogate escape | yes | yes |
-| `ErrMalformedJSON` | not one JSON value, `NaN`, `Infinity` and a byte order mark included | yes | yes |
+| `ErrInvalidUnicode` | invalid UTF-8 anywhere, or a lone or misordered surrogate escape in a name or value, read up to any grammar break | yes | yes |
+| `ErrMalformedJSON` | not one complete JSON value at the start: empty, cut short, a grammar break, `NaN`, `Infinity`, an incomplete fraction or exponent, or a byte order mark | yes | yes |
 | `ErrNestingTooDeep` | nesting above 32, counting objects and arrays | | yes |
 | `ErrTrailingData` | anything but JSON whitespace after the value | yes | yes |
 | `ErrDuplicateMember` | two members of one object with the same name, compared after unescaping | yes | yes |
-| `ErrCaseVariantMember` | two names in one object equal under the closed fold, or a name equal under it to a member the caller's `Shape` defines | | yes |
-| `ErrNotAnObject` | a top-level value that is not an object | | yes |
+| `ErrCaseVariantMember` | two names in one object equal under the closed fold, or a name equal under it to a member the caller's `Shape` defines for that object or one enclosing it | | yes |
+| `ErrNotAnObject` | a top-level value that is not an object | decoder error | yes |
 
 The closed fold folds ASCII letters, `ſ` to `s` and the Kelvin sign to `k`,
 and nothing else. It is not Unicode case folding, which changes with the

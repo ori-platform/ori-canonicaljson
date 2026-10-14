@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // The reasons a wire document is refused, as ori-specs gateway-api/v2's strict
@@ -16,8 +18,9 @@ import (
 // earliest wins, so every reader names the same reason whatever order its
 // parser finds violations in. A refusal wraps exactly one of them.
 var (
-	// ErrInvalidUnicode is invalid UTF-8, or a lone or misordered surrogate
-	// escape, in any name or value.
+	// ErrInvalidUnicode is invalid UTF-8 anywhere, or a lone or misordered
+	// surrogate escape in a name or value of the document, read up to any
+	// grammar break.
 	ErrInvalidUnicode = errors.New("canonicaljson: invalid_unicode")
 	// ErrMalformedJSON is a document that is not one JSON value, NaN and
 	// Infinity included.
@@ -52,7 +55,9 @@ const MaxNestingDepth = 32
 // acceptable that the strict member rule refuses; it adds the refusals that
 // need the contract's names.
 type Shape struct {
-	// Members are the member names the contract defines for the object. A
+	// Members are the member names the contract defines. They hold for the
+	// object and every object within it, at any depth and inside arrays, as
+	// gateway-api/v2 defines a payload's members for every object of it. A
 	// name that is not one of them but is equal to one under the closed fold
 	// is refused as ErrCaseVariantMember. Other names are tolerated.
 	Members []string
@@ -108,14 +113,20 @@ var (
 // check applies r to raw, then the refusals that need shape, and returns the
 // highest-ranked refusal present.
 func check(raw []byte, shape *Shape, r rule) error {
-	if err := ValidateWireUnicode(raw); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUnicode, err)
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("%w: the payload is not valid UTF-8", ErrInvalidUnicode)
 	}
 	s := scanner{data: raw, rule: r}
+	// Surrogate escapes are judged within the value up to any grammar break:
+	// one met before the break outranks it, and nothing after the break is
+	// read.
 	if err := s.scan(shape); err != nil {
+		if s.surrogate != nil {
+			return s.surrogate.err()
+		}
 		return err
 	}
-	for _, found := range []*refusal{s.tooDeep, s.trailing, s.duplicate, s.caseVariant, s.notObject, s.missing} {
+	for _, found := range []*refusal{s.surrogate, s.tooDeep, s.trailing, s.duplicate, s.caseVariant, s.notObject, s.missing} {
 		if found != nil {
 			return found.err()
 		}
@@ -140,6 +151,9 @@ func (r *refusal) err() error {
 type frame struct {
 	object bool
 	shape  *Shape
+	// defined are the member names that hold for objects in this
+	// container: its own shape's and every enclosing shape's.
+	defined []string
 	// For an object: the names seen, exactly and folded, and the member
 	// whose value is being read. For an array: the next element's index.
 	names  map[string]struct{}
@@ -147,12 +161,6 @@ type frame struct {
 	member string
 	index  int
 }
-
-// deepObject and deepArray stand for every level past the tracked depth.
-var (
-	deepObject = &frame{object: true}
-	deepArray  = &frame{}
-)
 
 // scanner walks a document without recursion, so no depth limit of its own
 // can turn a deep document into a syntax error: nesting_too_deep must outrank
@@ -163,8 +171,11 @@ type scanner struct {
 	pos   int
 	stack []*frame
 	rule  rule
+	// deepObject and deepArray stand for every level past the tracked
+	// depth. Each scan has its own, since a scan writes to them.
+	deepObject, deepArray *frame
 
-	tooDeep, trailing, duplicate, caseVariant, notObject, missing *refusal
+	surrogate, tooDeep, trailing, duplicate, caseVariant, notObject, missing *refusal
 }
 
 func (s *scanner) malformed(what string) error {
@@ -194,14 +205,20 @@ func (s *scanner) scan(root *Shape) error {
 				// Past the tracked depth a level is only parsed: it shares
 				// one frame and tracks no names, and a hostile depth
 				// costs a pointer a level.
-				f = deepArray
+				if s.deepObject == nil {
+					s.deepObject, s.deepArray = &frame{object: true}, &frame{}
+				}
+				f = s.deepArray
 				if c == '{' {
-					f = deepObject
+					f = s.deepObject
 				}
 			case c == '{':
-				f = &frame{object: true, shape: pending, names: map[string]struct{}{}, folded: map[string]string{}}
+				f = &frame{object: true, shape: pending, defined: s.inherited(), names: map[string]struct{}{}, folded: map[string]string{}}
+				if pending != nil && len(pending.Members) > 0 {
+					f.defined = append(slices.Clip(f.defined), pending.Members...)
+				}
 			default:
-				f = &frame{}
+				f = &frame{defined: s.inherited()}
 			}
 			// An array's elements have no shape.
 			pending = nil
@@ -360,15 +377,24 @@ func (s *scanner) member() (*Shape, error) {
 	} else if !seen {
 		top.folded[key] = name
 	}
-	if top.shape == nil {
-		return nil, nil
-	}
-	for _, defined := range top.shape.Members {
+	for _, defined := range top.defined {
 		if defined != name && fold(defined) == key {
 			s.noteCaseVariant(name, defined)
 		}
 	}
+	if top.shape == nil {
+		return nil, nil
+	}
 	return top.shape.Objects[name], nil
+}
+
+// inherited is the defined names of the innermost open container, which a
+// container opened inside it inherits.
+func (s *scanner) inherited() []string {
+	if len(s.stack) == 0 {
+		return nil
+	}
+	return s.stack[len(s.stack)-1].defined
 }
 
 func (s *scanner) noteCaseVariant(name, other string) {
@@ -402,21 +428,59 @@ func (s *scanner) skipString() error {
 			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 				s.pos++
 			case 'u':
-				if s.pos+5 > len(s.data) {
-					return s.malformed("short unicode escape")
+				unit, err := s.unicodeEscape()
+				if err != nil {
+					return err
 				}
-				for _, h := range s.data[s.pos+1 : s.pos+5] {
-					if !isHex(h) {
-						return s.malformed("invalid unicode escape")
+				switch {
+				case unit >= 0xDC00 && unit <= 0xDFFF:
+					s.noteSurrogate(unit)
+				case unit >= 0xD800 && unit <= 0xDBFF:
+					// A high surrogate must be followed at once by an escaped
+					// low one, which completes the pair.
+					if s.pos+1 < len(s.data) && s.data[s.pos] == '\\' && s.data[s.pos+1] == 'u' {
+						s.pos++
+						low, err := s.unicodeEscape()
+						if err != nil {
+							// A cut escape names no code unit, so the high
+							// surrogate before it is lone, and that outranks
+							// the grammar break.
+							s.noteSurrogate(unit)
+							return err
+						}
+						if low < 0xDC00 || low > 0xDFFF {
+							s.noteSurrogate(unit)
+						}
+					} else {
+						s.noteSurrogate(unit)
 					}
 				}
-				s.pos += 5
 			default:
 				return s.malformed("invalid escape")
 			}
 		default:
 			s.pos++
 		}
+	}
+}
+
+// unicodeEscape reads the u and four hex digits of a \u escape at the
+// cursor and returns the code unit.
+func (s *scanner) unicodeEscape() (rune, error) {
+	if s.pos+5 > len(s.data) {
+		return 0, s.malformed("short unicode escape")
+	}
+	unit, ok := parseHex4(s.data, s.pos+1)
+	if !ok {
+		return 0, s.malformed("invalid unicode escape")
+	}
+	s.pos += 5
+	return unit, nil
+}
+
+func (s *scanner) noteSurrogate(unit rune) {
+	if s.surrogate == nil {
+		s.surrogate = &refusal{reason: ErrInvalidUnicode, detail: fmt.Sprintf("unpaired surrogate U+%04X at byte %d", unit, s.pos)}
 	}
 }
 
@@ -445,10 +509,12 @@ func (s *scanner) number() error {
 	default:
 		return s.malformed("invalid number")
 	}
+	// A number takes the longest continuation, and a fraction or exponent
+	// that has begun must complete.
 	if s.pos < len(s.data) && s.data[s.pos] == '.' {
 		s.pos++
 		if s.digits() == 0 {
-			return s.malformed("invalid number")
+			return s.malformed("incomplete fraction")
 		}
 	}
 	if s.pos < len(s.data) && (s.data[s.pos] == 'e' || s.data[s.pos] == 'E') {
@@ -457,7 +523,7 @@ func (s *scanner) number() error {
 			s.pos++
 		}
 		if s.digits() == 0 {
-			return s.malformed("invalid number")
+			return s.malformed("incomplete exponent")
 		}
 	}
 	return nil

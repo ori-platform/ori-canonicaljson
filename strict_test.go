@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"unicode"
 	"unicode/utf8"
@@ -121,7 +122,34 @@ var strictCases = []struct {
 
 	// Precedence: the earliest reason in the rule's table wins.
 	{"a lone surrogate inside a duplicated member", `{"a":"\ud800","a":1}`, canonicaljson.ErrInvalidUnicode},
-	{"a lone surrogate after malformed JSON", `{"a":NaN,"b":"\udc00"}`, canonicaljson.ErrInvalidUnicode},
+	{"a lone surrogate after a grammar break", `{"a":NaN,"b":"\udc00"}`, canonicaljson.ErrMalformedJSON},
+	{"a lone surrogate before a grammar break", `{"a":"\udc00","b":NaN}`, canonicaljson.ErrInvalidUnicode},
+	{"a lone surrogate in a payload that stops", `{"a":"\ud800`, canonicaljson.ErrInvalidUnicode},
+	{"a lone surrogate and trailing data", `{"a":"\ud800"} x`, canonicaljson.ErrInvalidUnicode},
+	{"a surrogate after the value", `{"a":1}\ud800`, canonicaljson.ErrTrailingData},
+	{"invalid UTF-8 after the value", "{\"a\":1}\xff", canonicaljson.ErrInvalidUnicode},
+	{"a surrogate escape outside a string", `{\ud800}`, canonicaljson.ErrMalformedJSON},
+	{"an escape with a bad hex digit", `{"a":"\u12G4"}`, canonicaljson.ErrMalformedJSON},
+	{"an escape cut short", `{"a":"\u"}`, canonicaljson.ErrMalformedJSON},
+	{"a high surrogate before an escape cut short", `{"a":"\ud800\u12"}`, canonicaljson.ErrInvalidUnicode},
+	{"a pair in upper-case hex", `{"a":"\uD83D\uDE00"}`, nil},
+	{"two high surrogates", `{"a":"\ud800\ud800"}`, canonicaljson.ErrInvalidUnicode},
+
+	{"a top-level 01", `01`, canonicaljson.ErrTrailingData},
+	{"a nested 01", `{"a":[01]}`, canonicaljson.ErrMalformedJSON},
+	{"an incomplete fraction", `1.`, canonicaljson.ErrMalformedJSON},
+	{"an incomplete exponent", `1e`, canonicaljson.ErrMalformedJSON},
+	{"an exponent with only a sign", `{"a":1e+}`, canonicaljson.ErrMalformedJSON},
+	{"a second fraction at the top level", `1.5.`, canonicaljson.ErrTrailingData},
+	{"a fraction after an exponent at the top level", `1e5.`, canonicaljson.ErrTrailingData},
+	{"a second fraction nested", `{"a":1.5.}`, canonicaljson.ErrMalformedJSON},
+	{"a large number", `{"a":1e400}`, nil},
+
+	{"a missing colon past the bound", nested(40, `{"a" 1}`), canonicaljson.ErrMalformedJSON},
+	{"a brace closing an array", `{"a":[1}`, canonicaljson.ErrMalformedJSON},
+	{"a brace closing an array past the bound", nested(40, `[1}`), canonicaljson.ErrMalformedJSON},
+	{"a case variant inside a top-level array", `[{"a":1,"A":2}]`, canonicaljson.ErrCaseVariantMember},
+	{"thirty-two arrays around a number", strings.Repeat("[", 32) + "1" + strings.Repeat("]", 32), canonicaljson.ErrNotAnObject},
 	{"malformed JSON deeper than the bound", nested(40, `NaN`), canonicaljson.ErrMalformedJSON},
 	{"malformed JSON after a duplicate", `{"a":1,"a":2,"b":}`, canonicaljson.ErrMalformedJSON},
 	{"too deep and trailing", nested(33, `1`) + `x`, canonicaljson.ErrNestingTooDeep},
@@ -159,6 +187,11 @@ var marshalWireDiffers = map[string]error{
 	"a duplicate below the bound and nesting above it": canonicaljson.ErrDuplicateMember,
 	"a case variant and trailing data":                 canonicaljson.ErrTrailingData,
 	"a duplicate deeper than the bound":                canonicaljson.ErrDuplicateMember,
+	"a case variant inside a top-level array":          errDecoderRefuses,
+	"thirty-two arrays around a number":                errDecoderRefuses,
+	"a top-level 01":                                   canonicaljson.ErrTrailingData,
+	"a second fraction at the top level":               canonicaljson.ErrTrailingData,
+	"a fraction after an exponent at the top level":    canonicaljson.ErrTrailingData,
 }
 
 // TestStrictMemberRule runs every case through both entry points.
@@ -223,6 +256,10 @@ func TestShapeRefusals(t *testing.T) {
 		{"a missing required member", `{"device_id":"d"}`, canonicaljson.ErrMissingMember},
 		{"a missing nested required member", `{"device_id":"d","status":"ok","evidence":{}}`, canonicaljson.ErrMissingMember},
 		{"a nested shape is not applied to an array", `{"device_id":"d","status":"ok","evidence":[{"Available":true}]}`, nil},
+		{"a defined name holds in a nested object", `{"device_id":"d","status":"ok","x":{"STATUS":1}}`, canonicaljson.ErrCaseVariantMember},
+		{"a defined name holds inside an array", `{"device_id":"d","status":"ok","x":[{"Device_ID":1}]}`, canonicaljson.ErrCaseVariantMember},
+		{"a nested shape's names hold below it", `{"device_id":"d","status":"ok","evidence":{"available":true,"x":{"AVAILABLE":1}}}`, canonicaljson.ErrCaseVariantMember},
+		{"a nested shape's names do not hold beside it", `{"device_id":"d","status":"ok","evidence":{"available":true},"x":{"AVAILABLE":1}}`, nil},
 		{"a case variant outranks a missing member", `{"device_id":"d","STATUS":"ok"}`, canonicaljson.ErrCaseVariantMember},
 		{"a duplicate outranks a case variant", `{"device_id":"d","STATUS":"ok","STATUS":"ok"}`, canonicaljson.ErrDuplicateMember},
 	} {
@@ -321,28 +358,40 @@ func TestTheClosedFoldIsWhatTheStructDecoderMatches(t *testing.T) {
 	}
 }
 
-// FuzzTheScannerAgreesWithEncodingJSON is a differential: on any input with
-// valid Unicode and nesting within MaxNestingDepth, the strict scan finds
-// malformed or trailing data exactly when json.Valid refuses it.
+// FuzzTheScannerAgreesWithEncodingJSON is a differential with json.Valid, on
+// inputs whose Unicode and depth encoding/json can judge. MarshalWire applies
+// no depth bound, so its scan of the whole document refuses malformed or
+// trailing data exactly when json.Valid refuses it. DecodeStrict agrees
+// wherever nesting does not decide: a too-deep document MarshalWire finds
+// malformed must be malformed under DecodeStrict too, since malformed_json
+// outranks nesting_too_deep.
 func FuzzTheScannerAgreesWithEncodingJSON(f *testing.F) {
 	for _, c := range strictCases {
 		f.Add([]byte(c.doc))
 	}
-	for _, seed := range []string{`{"a":-0.0e-0}`, `{"a":"\/\b\f\n\r\té"}`, `{"a":[[],{}]}`, `{"a":1e5,"b":-1E+2}`} {
+	for _, seed := range []string{`{"a":-0.0e-0}`, `{"a":"\/\b\f\n\r\t\u00e9"}`, `{"a":[[],{}]}`, `{"a":1e5,"b":-1E+2}`} {
 		f.Add([]byte(seed))
 	}
 	f.Fuzz(func(t *testing.T, doc []byte) {
 		if canonicaljson.ValidateWireUnicode(doc) != nil || bytes.Count(doc, []byte("{"))+bytes.Count(doc, []byte("[")) > 9000 {
 			return
 		}
-		_, err := canonicaljson.DecodeStrict(doc, nil)
-		if errors.Is(err, canonicaljson.ErrNestingTooDeep) {
-			// It outranks trailing data, which the scan then does not report.
+		valid := json.Valid(doc)
+		_, wireErr := canonicaljson.MarshalWire(doc)
+		wireInvalid := errors.Is(wireErr, canonicaljson.ErrMalformedJSON) || errors.Is(wireErr, canonicaljson.ErrTrailingData)
+		if wireInvalid == valid {
+			t.Fatalf("%q: MarshalWire err = %v, json.Valid = %v", doc, wireErr, valid)
+		}
+		_, strictErr := canonicaljson.DecodeStrict(doc, nil)
+		if errors.Is(strictErr, canonicaljson.ErrNestingTooDeep) {
+			if errors.Is(wireErr, canonicaljson.ErrMalformedJSON) {
+				t.Fatalf("%q: DecodeStrict says too deep where the document is malformed", doc)
+			}
 			return
 		}
-		invalid := errors.Is(err, canonicaljson.ErrMalformedJSON) || errors.Is(err, canonicaljson.ErrTrailingData)
-		if invalid == json.Valid(doc) {
-			t.Fatalf("%q: strict scan err = %v, json.Valid = %v", doc, err, json.Valid(doc))
+		strictInvalid := errors.Is(strictErr, canonicaljson.ErrMalformedJSON) || errors.Is(strictErr, canonicaljson.ErrTrailingData)
+		if strictInvalid == valid {
+			t.Fatalf("%q: DecodeStrict err = %v, json.Valid = %v", doc, strictErr, valid)
 		}
 	})
 }
@@ -390,4 +439,29 @@ func TestMarshalWireBoundsHostileDepth(t *testing.T) {
 	if allocs > 100_000 {
 		t.Fatalf("MarshalWire made %.0f allocations for a million levels; past the decoder's depth a level must cost none", allocs)
 	}
+}
+
+// TestMarshalWireRefusesADuplicateAsDeepAsItDecodes requires a duplicate deep
+// in a document encoding/json still decodes to be refused, not canonicalised.
+func TestMarshalWireRefusesADuplicateAsDeepAsItDecodes(t *testing.T) {
+	_, err := canonicaljson.MarshalWire([]byte(nested(9990, `{"a":1,"a":2}`)))
+	requireReason(t, "MarshalWire", err, canonicaljson.ErrDuplicateMember)
+}
+
+// TestConcurrentScansShareNothing scans deep documents from several goroutines
+// at once; under the race detector a scan writing shared state fails.
+func TestConcurrentScansShareNothing(t *testing.T) {
+	doc := []byte(`{"a":` + strings.Repeat("[", 40) + "1,2" + strings.Repeat("]", 40) + `}`)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_, _ = canonicaljson.DecodeStrict(doc, nil)
+				_, _ = canonicaljson.MarshalWire(doc)
+			}
+		}()
+	}
+	wg.Wait()
 }
