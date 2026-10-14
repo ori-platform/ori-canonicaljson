@@ -116,6 +116,13 @@ var strictCases = []struct {
 
 	{"not an object", `[]`, canonicaljson.ErrNotAnObject},
 	{"a duplicate inside a top-level array", `[{"a":1,"a":2}]`, canonicaljson.ErrDuplicateMember},
+	{"null", `null`, canonicaljson.ErrNotAnObject},
+	{"a duplicate at depth 32", nested(31, `{"a":1,"a":2}`), canonicaljson.ErrDuplicateMember},
+	{"a case variant at depth 32", nested(31, `{"a":1,"A":2}`), canonicaljson.ErrCaseVariantMember},
+	{"a high surrogate before an escape past the low range", `{"a":"\ud800\ue000"}`, canonicaljson.ErrInvalidUnicode},
+	{"a lone low surrogate at the top of its range", `{"a":"\udfff"}`, canonicaljson.ErrInvalidUnicode},
+	{"a lone high surrogate at the top of its range", `{"a":"\udbff"}`, canonicaljson.ErrInvalidUnicode},
+	{"a pair at the edges of both ranges", `{"a":"\udbff\udfff"}`, nil},
 	{"a byte order mark", "\ufeff{}", canonicaljson.ErrMalformedJSON},
 	{"a duplicate deeper than the bound", nested(40, `{"a":1,"a":2}`), canonicaljson.ErrNestingTooDeep},
 	{"a scalar", `1`, canonicaljson.ErrNotAnObject},
@@ -188,10 +195,12 @@ var marshalWireDiffers = map[string]error{
 	"a case variant and trailing data":                 canonicaljson.ErrTrailingData,
 	"a duplicate deeper than the bound":                canonicaljson.ErrDuplicateMember,
 	"a case variant inside a top-level array":          errDecoderRefuses,
-	"thirty-two arrays around a number":                errDecoderRefuses,
-	"a top-level 01":                                   canonicaljson.ErrTrailingData,
-	"a second fraction at the top level":               canonicaljson.ErrTrailingData,
-	"a fraction after an exponent at the top level":    canonicaljson.ErrTrailingData,
+	"null":                                          errDecoderRefuses,
+	"a case variant at depth 32":                    nil,
+	"thirty-two arrays around a number":             errDecoderRefuses,
+	"a top-level 01":                                canonicaljson.ErrTrailingData,
+	"a second fraction at the top level":            canonicaljson.ErrTrailingData,
+	"a fraction after an exponent at the top level": canonicaljson.ErrTrailingData,
 }
 
 // TestStrictMemberRule runs every case through both entry points.
@@ -255,6 +264,7 @@ func TestShapeRefusals(t *testing.T) {
 		{"a nested unknown member", `{"device_id":"d","status":"ok","evidence":{"available":true,"x":1}}`, nil},
 		{"a missing required member", `{"device_id":"d"}`, canonicaljson.ErrMissingMember},
 		{"a missing nested required member", `{"device_id":"d","status":"ok","evidence":{}}`, canonicaljson.ErrMissingMember},
+		{"a defined name holds inside a top-level array", `[{"STATUS":1}]`, canonicaljson.ErrCaseVariantMember},
 		{"a nested shape is not applied to an array", `{"device_id":"d","status":"ok","evidence":[{"Available":true}]}`, nil},
 		{"a defined name holds in a nested object", `{"device_id":"d","status":"ok","x":{"STATUS":1}}`, canonicaljson.ErrCaseVariantMember},
 		{"a defined name holds inside an array", `{"device_id":"d","status":"ok","x":[{"Device_ID":1}]}`, canonicaljson.ErrCaseVariantMember},
@@ -444,7 +454,7 @@ func TestMarshalWireBoundsHostileDepth(t *testing.T) {
 // TestMarshalWireRefusesADuplicateAsDeepAsItDecodes requires a duplicate deep
 // in a document encoding/json still decodes to be refused, not canonicalised.
 func TestMarshalWireRefusesADuplicateAsDeepAsItDecodes(t *testing.T) {
-	_, err := canonicaljson.MarshalWire([]byte(nested(9990, `{"a":1,"a":2}`)))
+	_, err := canonicaljson.MarshalWire([]byte(nested(9999, `{"a":1,"a":2}`)))
 	requireReason(t, "MarshalWire", err, canonicaljson.ErrDuplicateMember)
 }
 
@@ -464,4 +474,48 @@ func TestConcurrentScansShareNothing(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestRefusalsCarryNoSenderControlTextAndStayBounded refuses documents whose
+// member names carry a forged log line, a terminal escape and 64 KiB of text,
+// at the level of the refusal and on the path to it. Every refusal must stay
+// within a fixed size and carry no control character, through both functions,
+// so a refusal can be logged as it is.
+func TestRefusalsCarryNoSenderControlTextAndStayBounded(t *testing.T) {
+	quoted, err := json.Marshal("x\n2026-10-14 level=ERROR forged \x1b[31m" + strings.Repeat("y", 1<<16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := string(quoted)
+	for name, doc := range map[string]string{
+		"a duplicate below a hostile name":     `{` + n + `:{"a":1,"a":2}}`,
+		"a duplicate of a hostile name":        `{"o":{` + n + `:1,` + n + `:2}}`,
+		"a case variant below a hostile name":  `{` + n + `:{"a":1,"A":2}}`,
+		"nesting below a hostile name":         `{` + n + `:` + nested(40, `1`) + `}`,
+		"a duplicate below many hostile names": strings.Repeat(`{`+n+`:`, 40) + `{"a":1,"a":2}` + strings.Repeat("}", 40),
+		"a case variant of a hostile name":     `{"o":{` + n + `:1,` + strings.ToUpper(n) + `:2}}`,
+	} {
+		for entry, decode := range map[string]func([]byte) error{
+			"DecodeStrict": func(b []byte) error { _, err := canonicaljson.DecodeStrict(b, nil); return err },
+			"MarshalWire":  func(b []byte) error { _, err := canonicaljson.MarshalWire(b); return err },
+		} {
+			err := decode([]byte(doc))
+			if err == nil {
+				if entry == "DecodeStrict" {
+					t.Fatalf("%s: %s accepted it", name, entry)
+				}
+				continue
+			}
+			msg := err.Error()
+			if len(msg) > 2048 {
+				t.Errorf("%s: %s's refusal is %d bytes", name, entry, len(msg))
+			}
+			for i := 0; i < len(msg); i++ {
+				if msg[i] < 0x20 || msg[i] == 0x7f {
+					t.Errorf("%s: %s's refusal carries control byte %#x", name, entry, msg[i])
+					break
+				}
+			}
+		}
+	}
 }

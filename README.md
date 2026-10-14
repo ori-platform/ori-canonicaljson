@@ -105,8 +105,8 @@ Unicode version a toolchain ships; it is exactly what `encoding/json` matches
 to an ASCII field name, and a test sweeping every scalar value fails if a
 toolchain's decoder ever matches more. Every object at every depth is checked,
 arrays included, without recursion, so a deep document is refused as too deep
-rather than as malformed, and a hostile depth costs nothing per level past the
-depth that can still change the outcome.
+rather than as malformed, and a hostile depth costs a pointer per level past
+the depth that can still change the outcome.
 
 `DecodeStrict` also refuses `ErrMissingMember` for a member a `Shape`
 requires, after every reason above. It returns the top-level members by exact

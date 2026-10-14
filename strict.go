@@ -219,6 +219,11 @@ func (s *scanner) scan(root *Shape) error {
 				}
 			default:
 				f = &frame{defined: s.inherited()}
+				if len(s.stack) == 0 && pending != nil {
+					// The root shape's names hold for every object of the
+					// document, an array's elements included.
+					f.defined = pending.Members
+				}
 			}
 			// An array's elements have no shape.
 			pending = nil
@@ -549,22 +554,31 @@ func (s *scanner) skipSpace() {
 	}
 }
 
-// path is the JSON Pointer of the innermost open container.
+// path names the innermost open container by the members and indices that
+// lead to it.
+//
+// A member name is the sender's text, so each is quoted and cut as a reported
+// name is, and only the innermost maxPathSegments are shown: an error carries
+// no control character and stays bounded whatever the payload names.
 func (s *scanner) path() string {
-	var b strings.Builder
-	for _, f := range s.stack[:max(len(s.stack)-1, 0)] {
-		b.WriteByte('/')
+	ancestors := s.stack[:max(len(s.stack)-1, 0)]
+	segments := make([]string, 0, min(len(ancestors), maxPathSegments))
+	for _, f := range ancestors[max(len(ancestors)-maxPathSegments, 0):] {
 		if f.object {
-			b.WriteString(strings.NewReplacer("~", "~0", "/", "~1").Replace(f.member))
+			segments = append(segments, boundedQuote(f.member))
 		} else {
-			b.WriteString(strconv.Itoa(f.index))
+			segments = append(segments, strconv.Itoa(f.index))
 		}
 	}
-	if b.Len() == 0 {
-		return "/"
+	prefix := "/"
+	if len(ancestors) > maxPathSegments {
+		prefix = fmt.Sprintf("/(%d levels)/", len(ancestors)-maxPathSegments)
 	}
-	return b.String()
+	return prefix + strings.Join(segments, "/")
 }
+
+// maxPathSegments is how many of a path's innermost levels an error shows.
+const maxPathSegments = 8
 
 // fold maps a name under the closed fold: ASCII letters fold to lower case,
 // U+017F to 's' and U+212A to 'k', and every other code point is kept. It is

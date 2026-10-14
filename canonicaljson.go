@@ -169,6 +169,11 @@ func MarshalWire(raw []byte) ([]byte, error) {
 	if dec.More() {
 		return nil, fmt.Errorf("canonicaljson: trailing bytes after JSON document")
 	}
+	if payload == nil {
+		// null decodes into a nil map without error; it is no object, and
+		// canonicalising it as {} would sign a document no one sent.
+		return nil, fmt.Errorf("canonicaljson: decode wire payload: the value is not an object")
+	}
 	return Marshal(payload)
 }
 
