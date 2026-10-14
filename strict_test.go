@@ -482,19 +482,31 @@ func TestConcurrentScansShareNothing(t *testing.T) {
 // within a fixed size and carry no control character, through both functions,
 // so a refusal can be logged as it is.
 func TestRefusalsCarryNoSenderControlTextAndStayBounded(t *testing.T) {
-	quoted, err := json.Marshal("x\n2026-10-14 level=ERROR forged \x1b[31m" + strings.Repeat("y", 1<<16))
-	if err != nil {
-		t.Fatal(err)
+	hostile := "x\n2026-10-14 level=ERROR forged \x1b[31m" + strings.Repeat("y", 1<<16)
+	quote := func(name string) string {
+		quoted, err := json.Marshal(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(quoted)
 	}
-	n := string(quoted)
-	for name, doc := range map[string]string{
-		"a duplicate below a hostile name":     `{` + n + `:{"a":1,"a":2}}`,
-		"a duplicate of a hostile name":        `{"o":{` + n + `:1,` + n + `:2}}`,
-		"a case variant below a hostile name":  `{` + n + `:{"a":1,"A":2}}`,
-		"nesting below a hostile name":         `{` + n + `:` + nested(40, `1`) + `}`,
-		"a duplicate below many hostile names": strings.Repeat(`{`+n+`:`, 40) + `{"a":1,"a":2}` + strings.Repeat("}", 40),
-		"a case variant of a hostile name":     `{"o":{` + n + `:1,` + strings.ToUpper(n) + `:2}}`,
+	n, upper := quote(hostile), quote(strings.ToUpper(hostile))
+	// Each case names the reason DecodeStrict gives, so none passes by being
+	// refused for something else before its sender text is reported.
+	for name, c := range map[string]struct {
+		doc  string
+		want error
+	}{
+		"a duplicate below a hostile name":     {`{` + n + `:{"a":1,"a":2}}`, canonicaljson.ErrDuplicateMember},
+		"a duplicate of a hostile name":        {`{"o":{` + n + `:1,` + n + `:2}}`, canonicaljson.ErrDuplicateMember},
+		"a case variant below a hostile name":  {`{` + n + `:{"a":1,"A":2}}`, canonicaljson.ErrCaseVariantMember},
+		"nesting below a hostile name":         {`{` + n + `:` + nested(40, `1`) + `}`, canonicaljson.ErrNestingTooDeep},
+		"a duplicate below many hostile names": {strings.Repeat(`{`+n+`:`, 40) + `{"a":1,"a":2}` + strings.Repeat("}", 40), canonicaljson.ErrNestingTooDeep},
+		"a case variant of a hostile name":     {`{"o":{` + n + `:1,` + upper + `:2}}`, canonicaljson.ErrCaseVariantMember},
 	} {
+		doc := c.doc
+		_, err := canonicaljson.DecodeStrict([]byte(doc), nil)
+		requireReason(t, name, err, c.want)
 		for entry, decode := range map[string]func([]byte) error{
 			"DecodeStrict": func(b []byte) error { _, err := canonicaljson.DecodeStrict(b, nil); return err },
 			"MarshalWire":  func(b []byte) error { _, err := canonicaljson.MarshalWire(b); return err },
