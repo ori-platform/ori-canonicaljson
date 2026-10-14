@@ -142,16 +142,22 @@ func Marshal(payload map[string]any) ([]byte, error) {
 
 // MarshalWire canonicalises JSON received as bytes.
 //
-// It validates the Unicode first, then decodes with UseNumber so every number
-// keeps the spelling it arrived with, then writes the canonical form. This is
-// the operation a verifier needs: reproduce the preimage a producer signed,
-// without re-deciding how any number should look.
+// It refuses what every contract it canonicalises for already refuses:
+// invalid Unicode, malformed JSON, trailing data, and a member named twice in
+// one object, at any depth, each with its own error (see DecodeStrict).
+// Canonicalising whichever of two same-named members a decoder kept would give
+// one signed byte sequence two meanings. It applies none of gateway-api/v2's
+// further refusals, which not every contract makes: a runtime-gateway payload
+// is admitted with DecodeStrict first. Then it decodes with UseNumber so every
+// number keeps the spelling it arrived with, and writes the canonical form.
+// This is the operation a verifier needs: reproduce the preimage a producer
+// signed, without re-deciding how any number should look.
 //
 // A producer building a document from typed values does not use this. It
 // assembles a map of json.Number values -- see the d011 subpackage for the
 // contracts that constrain them -- and calls Marshal.
 func MarshalWire(raw []byte) ([]byte, error) {
-	if err := ValidateWireUnicode(raw); err != nil {
+	if err := check(raw, nil, canonicalRule); err != nil {
 		return nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -162,6 +168,11 @@ func MarshalWire(raw []byte) ([]byte, error) {
 	}
 	if dec.More() {
 		return nil, fmt.Errorf("canonicaljson: trailing bytes after JSON document")
+	}
+	if payload == nil {
+		// null decodes into a nil map without error; it is no object, and
+		// canonicalising it as {} would sign a document no one sent.
+		return nil, fmt.Errorf("canonicaljson: decode wire payload: the value is not an object")
 	}
 	return Marshal(payload)
 }
